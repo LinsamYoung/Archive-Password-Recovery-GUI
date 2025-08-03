@@ -1,1 +1,0 @@
-rar2john.exe xxx.rar

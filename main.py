@@ -31,7 +31,14 @@ from PySide6.QtWidgets import (
 )
 
 
-APP_DIR = Path(__file__).resolve().parent
+# PyInstaller --onefile extracts bundled Python files to a temporary _MEI folder.
+# External cracking tools are intentionally not bundled, so locate them beside the
+# executable instead of beside the extracted main.py when running a frozen build.
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
 JOHN_RUN_DIR = APP_DIR / "john-1.9.0-jumbo-1-win64" / "run"
 HASHCAT_DIR = APP_DIR / "hashcat-7.1.2"
 SEVEN_ZIP_EXTRACTOR = APP_DIR / "7z2hashcat64-2.0" / "7z2hashcat64-2.0.exe"

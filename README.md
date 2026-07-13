@@ -4,7 +4,8 @@
 *A GUI for operating hashcat to recover passwords from encrypted RAR, ZIP, and 7Z archives.*
 
 ## 仅供学习使用，若用于违法使用，后果与作者无关
-![image](https://github.com/LinShancc/Encrypt-Archive-file-cracker/assets/129955394/a712b310-192d-4f65-82ed-5b8909dea9a3)
+<img width="1144" height="857" alt="image" src="https://github.com/user-attachments/assets/2f49b57b-9e75-4970-8986-75c99d2c9448" />
+
 
 ## 支持 RAR、ZIP、7Z
 

@@ -257,7 +257,7 @@ class ArchiveCracker(QMainWindow):
         self._build_tool_check_panel(layout)
 
         layout.addStretch()
-        version_label = QLabel("版本号：2.0")
+        version_label = QLabel("版本号：2.1.0")
         version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(version_label)
 

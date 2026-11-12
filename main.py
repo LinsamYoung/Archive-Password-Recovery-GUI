@@ -8,9 +8,11 @@ import shutil
 import sys
 import tempfile
 import time
+import zipfile
+import zlib
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, Qt
+from PySide6.QtCore import QProcess, QThread, Qt, Signal
 from PySide6.QtGui import QCursor, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -32,6 +34,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from zip_hash import effective_hashcat_zip_mode, parse_zip_hash
+
 
 # PyInstaller --onefile extracts bundled Python files to a temporary _MEI folder.
 # External cracking tools are intentionally not bundled, so locate them beside the
@@ -46,6 +50,73 @@ HASHCAT_DIR = APP_DIR / "hashcat-7.1.2"
 SEVEN_ZIP_EXTRACTOR = APP_DIR / "7z2hashcat64-2.0" / "7z2hashcat64-2.0.exe"
 SUPPORTED_SUFFIXES = {".rar", ".zip", ".7z"}
 SPACE_RESERVE_BYTES = 1024**3
+MAX_PROCESS_OUTPUT_BYTES = 8 * 1024**2
+
+
+class ZipCandidateVerifier(QThread):
+    """在后台逐个尝试 ZIP 候选，并完整读取加密成员以校验 CRC。"""
+
+    finished_check = Signal(object, str)
+
+    def __init__(self, archive_path: Path, output_path: Path) -> None:
+        super().__init__()
+        self.archive_path = archive_path
+        self.output_path = output_path
+
+    def run(self) -> None:
+        checked = 0
+        last_validation_error = ""
+        try:
+            with zipfile.ZipFile(self.archive_path) as archive:
+                encrypted_members = [info for info in archive.infolist() if info.flag_bits & 0x1]
+                if not encrypted_members:
+                    self.finished_check.emit(None, "原 ZIP 中没有可验证的加密成员。")
+                    return
+                with self.output_path.open("rb") as candidates:
+                    for candidate_line in candidates:
+                        if self.isInterruptionRequested():
+                            self.finished_check.emit(None, "候选验证已取消。")
+                            return
+                        candidate_line = candidate_line.rstrip(b"\r\n")
+                        if not candidate_line:
+                            continue
+                        candidate = self._decode_candidate(candidate_line)
+                        checked += 1
+                        valid, validation_error = self._verify_candidate(archive, encrypted_members, candidate)
+                        if valid:
+                            self.finished_check.emit(candidate, "")
+                            return
+                        if validation_error:
+                            last_validation_error = validation_error
+            detail = f"检查了 {checked} 个候选，没有候选能通过原 ZIP 完整校验。"
+            if last_validation_error:
+                detail += f" 最近一次校验错误：{last_validation_error}"
+            self.finished_check.emit(None, detail)
+        except (OSError, zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError, ValueError) as error:
+            self.finished_check.emit(None, f"读取原 ZIP 或候选结果时失败：{error}")
+
+    @staticmethod
+    def _decode_candidate(candidate: bytes) -> bytes:
+        match = re.fullmatch(rb"\$HEX\[([0-9a-fA-F]*)\]", candidate)
+        if match:
+            try:
+                return bytes.fromhex(match.group(1).decode("ascii"))
+            except ValueError:
+                return candidate
+        return candidate
+
+    def _verify_candidate(
+        self, archive: zipfile.ZipFile, members: list[zipfile.ZipInfo], candidate: bytes
+    ) -> tuple[bool, str]:
+        try:
+            for info in members:
+                with archive.open(info, "r", pwd=candidate) as member:
+                    while member.read(1024 * 1024):
+                        if self.isInterruptionRequested():
+                            return False, "验证已取消。"
+            return True, ""
+        except (RuntimeError, zipfile.BadZipFile, zlib.error, EOFError, ValueError) as error:
+            return False, str(error)
 
 
 class ArchiveCracker(QMainWindow):
@@ -62,8 +133,11 @@ class ArchiveCracker(QMainWindow):
         self.tool_archive_path: Path | None = None
         self.output_file: Path | None = None
         self.hash_file: Path | None = None
+        self.zip_validation_required = False
+        self.verifier: ZipCandidateVerifier | None = None
         self._stdout_buffer = bytearray()
         self._stderr_buffer = bytearray()
+        self._process_output_truncated = False
         self._status_line_buffer = ""
         self._status_updates_enabled = False
 
@@ -252,6 +326,7 @@ class ArchiveCracker(QMainWindow):
             return
 
         self.archive_path = Path(file_name)
+        self.zip_validation_required = False
         self.filename_label.setText(f"文件名：{self.archive_path.name}")
         self.filepath_label.setText(f"路径：{self.archive_path}")
         self.password_label.setText("密码：未开始")
@@ -397,6 +472,7 @@ class ArchiveCracker(QMainWindow):
         self.process = QProcess(self)
         self._stdout_buffer.clear()
         self._stderr_buffer.clear()
+        self._process_output_truncated = False
         self._status_line_buffer = ""
         self._status_updates_enabled = status_updates
         self.process.setProgram(str(program))
@@ -415,15 +491,34 @@ class ArchiveCracker(QMainWindow):
         if self._status_updates_enabled:
             self._consume_status_output(output)
         else:
-            self._stdout_buffer.extend(output)
+            self._append_process_output(self._stdout_buffer, output)
 
     def _on_standard_error_ready(self) -> None:
         if self.process is not None:
-            self._stderr_buffer.extend(bytes(self.process.readAllStandardError()))
+            self._append_process_output(self._stderr_buffer, bytes(self.process.readAllStandardError()))
+
+    def _append_process_output(self, buffer: bytearray, output: bytes) -> None:
+        remaining = MAX_PROCESS_OUTPUT_BYTES - len(buffer)
+        if remaining > 0:
+            buffer.extend(output[:remaining])
+        if len(output) > remaining:
+            self._process_output_truncated = True
 
     def _drain_process_output(self) -> None:
         self._on_standard_output_ready()
         self._on_standard_error_ready()
+        if self._status_line_buffer:
+            pending = self._status_line_buffer
+            self._status_line_buffer = ""
+            try:
+                status = json.loads(pending)
+            except json.JSONDecodeError:
+                self._append_process_output(self._stdout_buffer, pending.encode(errors="replace"))
+            else:
+                if isinstance(status, dict):
+                    self._update_hashcat_progress(status)
+                else:
+                    self._append_process_output(self._stdout_buffer, pending.encode(errors="replace"))
 
     def _consume_status_output(self, output: bytes) -> None:
         self._status_line_buffer += output.decode(errors="replace")
@@ -431,12 +526,20 @@ class ArchiveCracker(QMainWindow):
         self._status_line_buffer = ""
         if lines and not lines[-1].endswith(("\n", "\r")):
             self._status_line_buffer = lines.pop()
+        if len(self._status_line_buffer) > 64 * 1024:
+            self._append_process_output(self._stdout_buffer, self._status_line_buffer.encode(errors="replace"))
+            self._status_line_buffer = ""
+            self._process_output_truncated = True
         for line in lines:
             try:
                 status = json.loads(line)
             except json.JSONDecodeError:
+                self._append_process_output(self._stdout_buffer, line.encode(errors="replace"))
                 continue
-            self._update_hashcat_progress(status)
+            if isinstance(status, dict):
+                self._update_hashcat_progress(status)
+            else:
+                self._append_process_output(self._stdout_buffer, line.encode(errors="replace"))
 
     def _update_hashcat_progress(self, status: dict) -> None:
         progress = status.get("progress")
@@ -497,21 +600,37 @@ class ArchiveCracker(QMainWindow):
             return f"{days}天{hours:02d}:{minutes:02d}:{seconds:02d}"
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
+    def _format_process_diagnostics(self, stdout: str, stderr: str) -> str:
+        parts = []
+        if stdout.strip():
+            parts.append(f"stdout:\n{stdout.strip()}")
+        if stderr.strip():
+            parts.append(f"stderr:\n{stderr.strip()}")
+        if self._process_output_truncated:
+            parts.append(f"外部工具输出超过 {MAX_PROCESS_OUTPUT_BYTES // (1024 * 1024)} MiB，已截断后续内容。")
+        return "\n\n".join(parts)
+
     def _on_hash_extracted(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
         assert self.process is not None
         self._drain_process_output()
         output = bytes(self._stdout_buffer).decode(errors="replace")
         error = bytes(self._stderr_buffer).decode(errors="replace")
         if exit_code != 0:
-            self._fail("提取压缩包哈希失败。", error)
+            self._fail("提取压缩包哈希失败。", self._format_process_diagnostics(output, error))
             return
 
-        self.extracted_hash, mode = self._parse_hash(output)
+        try:
+            self.extracted_hash, mode, self.zip_validation_required = self._parse_hash(output)
+        except ValueError as parse_error:
+            self._fail("无法识别 ZIP 哈希结构。", f"{parse_error}\n\n{self._format_process_diagnostics(output, error)}")
+            return
         if not self.extracted_hash or mode is None:
-            self._fail("未能识别该压缩包的加密格式。", error or output)
+            self._fail("未能识别该压缩包的加密格式。", self._format_process_diagnostics(output, error))
             return
 
         self.password_label.setText("密码：正在找回…")
+        if self.zip_validation_required:
+            self.password_label.setText("密码：仅校验和模式，搜索完成后验证候选密码")
         self._set_progress_busy("正在找回…")
         assert self.hash_file is not None and self.output_file is not None
         self.hash_file.write_text(self.extracted_hash + "\n", encoding="utf-8")
@@ -522,37 +641,39 @@ class ArchiveCracker(QMainWindow):
         min_length = self.min_length_input.value()
         max_length = self.max_length_input.value()
         mask = "?1" * max_length
-        self._run_process(
-            HASHCAT_DIR / "hashcat.exe",
-            ["-m", str(mode), "-a", "3", "-1", charset, str(self.hash_file), mask,
+        runtime_mode, compatibility_fallback = effective_hashcat_zip_mode(mode, HASHCAT_DIR)
+        if compatibility_fallback:
+            self.password_label.setText("密码：正在找回…（hashcat 17220 上游文件缺失，使用兼容模式 17225）")
+        arguments = ["-m", str(runtime_mode), "-a", "3", "-1", charset, str(self.hash_file), mask,
              "--increment", "--increment-min", str(min_length), "--increment-max", str(max_length),
              "-o", str(self.output_file), "--outfile-format", "2", "--potfile-disable",
              "--logfile-disable", "--restore-file-path", str(self.hash_file.parent / "hashcat.restore"),
-             "--status", "--status-json", "--status-timer", "1"],
+             "--status", "--status-json", "--status-timer", "1"]
+        if self.zip_validation_required:
+            arguments.append("--keep-guessing")
+        self._run_process(
+            HASHCAT_DIR / "hashcat.exe",
+            arguments,
             HASHCAT_DIR,
             self._on_cracking_finished,
             status_updates=True,
         )
 
     @staticmethod
-    def _parse_hash(output: str) -> tuple[str | None, int | None]:
+    def _parse_hash(output: str) -> tuple[str | None, int | None, bool]:
         rar_match = re.search(r"(\$rar3\$.*|\$rar5\$.*)", output, re.IGNORECASE)
         if rar_match:
             archive_hash = rar_match.group(1).strip()
-            return archive_hash, 12500 if archive_hash.lower().startswith("$rar3$") else 13000
+            return archive_hash, 12500 if archive_hash.lower().startswith("$rar3$") else 13000, False
 
-        zip2_match = re.search(r"(\$zip2\$.*?\$/zip2\$)", output)
-        if zip2_match:
-            return zip2_match.group(1), 13600
-
-        pkzip2_match = re.search(r"\$pkzip2\$(.*?)\$/pkzip2\$", output)
-        if pkzip2_match:
-            return f"$pkzip2${pkzip2_match.group(1)}$/pkzip2$", 17200
+        zip_hash, zip_mode, verify_zip_candidate = parse_zip_hash(output)
+        if zip_hash:
+            return zip_hash, zip_mode, verify_zip_candidate
 
         seven_zip_match = re.search(r"(\$7z\$.*)", output)
         if seven_zip_match:
-            return seven_zip_match.group(1).strip(), 11600
-        return None, None
+            return seven_zip_match.group(1).strip(), 11600, False
+        return None, None, False
 
     def _selected_charset(self) -> str:
         charset_parts = []
@@ -575,18 +696,55 @@ class ArchiveCracker(QMainWindow):
             self.min_length_input.setValue(self.max_length_input.value())
 
     def _on_cracking_finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
+        self._drain_process_output()
+        stdout = bytes(self._stdout_buffer).decode(errors="replace")
+        stderr = bytes(self._stderr_buffer).decode(errors="replace")
+        if self.zip_validation_required:
+            assert self.output_file is not None and self.archive_path is not None
+            if exit_code not in (0, 1):
+                self._fail("hashcat 执行失败。", self._format_process_diagnostics(stdout, stderr))
+                return
+            if not self.output_file.exists() or self.output_file.stat().st_size == 0:
+                self.password_label.setText("密码：未找到有效密码")
+                self._cleanup_workspace()
+                self._set_progress_complete()
+                self._set_running(False)
+                return
+            self.password_label.setText("密码：正在验证候选密码…")
+            self._set_progress_busy("正在验证候选密码…")
+            self.verifier = ZipCandidateVerifier(self.archive_path, self.output_file)
+            self.verifier.finished_check.connect(self._on_zip_candidates_verified)
+            self.verifier.start()
+            return
+
         password = self._read_password()
         if password is not None:
             self.recovered_password = password
             self.password_label.setText(f"密码：{password}")
             self.copy_button.setEnabled(True)
-        elif exit_code == 0:
+        elif exit_code in (0, 1):
             self.password_label.setText("密码：未找到（可尝试调整 hashcat 参数或掩码）")
         else:
-            self._drain_process_output()
-            error = bytes(self._stderr_buffer).decode(errors="replace")
-            self._fail("hashcat 执行失败。", error)
+            self._fail("hashcat 执行失败。", self._format_process_diagnostics(stdout, stderr))
             return
+        self._cleanup_workspace()
+        self._set_progress_complete()
+        self._set_running(False)
+
+    def _on_zip_candidates_verified(self, candidate: object, detail: str) -> None:
+        if self.verifier is not None:
+            self.verifier.wait()
+        self.verifier = None
+        if isinstance(candidate, bytes):
+            self.recovered_password = candidate.decode("utf-8", errors="replace")
+            self.password_label.setText(f"密码：{self.recovered_password}")
+            self.copy_button.setEnabled(True)
+        elif detail.startswith("读取原 ZIP 或候选结果时失败"):
+            self._fail("无法验证 ZIP 候选密码。", detail)
+            return
+        else:
+            self.password_label.setText("密码：未找到有效密码" + (f"\n{detail}" if detail else ""))
+            self.progress_bar.setFormat("搜索完成，未找到通过 ZIP 完整校验的候选")
         self._cleanup_workspace()
         self._set_progress_complete()
         self._set_running(False)
@@ -594,6 +752,8 @@ class ArchiveCracker(QMainWindow):
     def _read_password(self) -> str | None:
         if self.recovered_password is not None:
             return self.recovered_password
+        if self.zip_validation_required:
+            return None
         if self.output_file is None or not self.output_file.exists():
             return None
         line = self.output_file.read_text(encoding="utf-8", errors="replace").strip().splitlines()
@@ -602,7 +762,7 @@ class ArchiveCracker(QMainWindow):
         return line[-1]
 
     def _on_process_error(self, _error: QProcess.ProcessError) -> None:
-        if self.process and self.process.state() == QProcess.ProcessState.NotRunning:
+        if _error == QProcess.ProcessError.FailedToStart and self.process is not None:
             self._fail("无法启动外部工具。", self.process.errorString())
 
     def _fail(self, message: str, detail: str = "") -> None:
@@ -611,6 +771,15 @@ class ArchiveCracker(QMainWindow):
         self._set_progress_failed()
         self._set_running(False)
         QMessageBox.critical(self, "操作失败", f"{message}\n\n{detail}".strip())
+
+    def closeEvent(self, event) -> None:
+        if self.verifier is not None:
+            if self.verifier.isRunning():
+                self.verifier.requestInterruption()
+                self.verifier.wait()
+            self._cleanup_workspace()
+            self.verifier = None
+        event.accept()
 
     def _cleanup_workspace(self) -> None:
         """仅清理本次任务的临时子目录，保留用户选择的缓存根目录。"""

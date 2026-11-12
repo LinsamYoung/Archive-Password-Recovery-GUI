@@ -16,9 +16,11 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QFileDialog,
+    QLineEdit,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -43,7 +45,6 @@ JOHN_RUN_DIR = APP_DIR / "john-1.9.0-jumbo-1-win64" / "run"
 HASHCAT_DIR = APP_DIR / "hashcat-7.1.2"
 SEVEN_ZIP_EXTRACTOR = APP_DIR / "7z2hashcat64-2.0" / "7z2hashcat64-2.0.exe"
 SUPPORTED_SUFFIXES = {".rar", ".zip", ".7z"}
-DRIVE_FIXED = 3
 SPACE_RESERVE_BYTES = 1024**3
 
 
@@ -57,7 +58,7 @@ class ArchiveCracker(QMainWindow):
         self.recovered_password: str | None = None
         self.process: QProcess | None = None
         self.workspace_path: Path | None = None
-        self.workspace_root: Path | None = None
+        self.cache_directory = APP_DIR / "tmp"
         self.tool_archive_path: Path | None = None
         self.output_file: Path | None = None
         self.hash_file: Path | None = None
@@ -73,12 +74,14 @@ class ArchiveCracker(QMainWindow):
         self.setMinimumSize(680, 460)
         self.resize(760, 540)
         self._build_ui()
+        self.setMinimumHeight(max(self.minimumHeight(), self.minimumSizeHint().height()))
 
     def _build_ui(self) -> None:
         central_widget = QWidget(self)
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(28, 24, 28, 20)
         layout.setSpacing(12)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
         self.select_button = QPushButton("选择 RAR / ZIP / 7Z 文件")
         self.select_button.clicked.connect(self.select_file)
@@ -155,6 +158,20 @@ class ArchiveCracker(QMainWindow):
         cache_layout.addWidget(self.cache_path_label, 1)
         layout.addLayout(cache_layout)
 
+        cache_controls = QHBoxLayout()
+        cache_controls.addWidget(QLabel("缓存位置："))
+        self.cache_directory_input = QLineEdit(str(self.cache_directory))
+        self.cache_directory_input.setReadOnly(True)
+        self.cache_directory_input.setToolTip("每次任务会在此目录下创建独立子目录，任务结束后仅删除该子目录。")
+        cache_controls.addWidget(self.cache_directory_input, 1)
+        self.cache_directory_button = QPushButton("选择目录")
+        self.cache_directory_button.clicked.connect(self.select_cache_directory)
+        cache_controls.addWidget(self.cache_directory_button)
+        self.cache_default_button = QPushButton("恢复默认")
+        self.cache_default_button.clicked.connect(self.reset_cache_directory)
+        cache_controls.addWidget(self.cache_default_button)
+        layout.addLayout(cache_controls)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -174,6 +191,7 @@ class ArchiveCracker(QMainWindow):
         """Add the bundled-tool availability panel below the progress bar."""
         tool_group = QGroupBox("工具存在检测")
         tool_layout = QGridLayout(tool_group)
+        tool_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         tool_layout.setColumnStretch(1, 1)
 
         self.tool_status_labels: dict[str, QLabel] = {}
@@ -242,6 +260,16 @@ class ArchiveCracker(QMainWindow):
         self.start_button.setEnabled(True)
         self.copy_button.setEnabled(False)
 
+    def select_cache_directory(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "选择缓存目录", str(self.cache_directory))
+        if selected:
+            self.cache_directory = Path(selected)
+            self.cache_directory_input.setText(str(self.cache_directory))
+
+    def reset_cache_directory(self) -> None:
+        self.cache_directory = APP_DIR / "tmp"
+        self.cache_directory_input.setText(str(self.cache_directory))
+
     def start_cracking(self) -> None:
         if not self.archive_path:
             QMessageBox.warning(self, "未选择文件", "请先选择一个 RAR、ZIP 或 7Z 文件。")
@@ -273,7 +301,7 @@ class ArchiveCracker(QMainWindow):
         self.extracted_hash = None
         self.recovered_password = None
         self.password_label.setText("密码：正在提取哈希…")
-        self.cache_path_label.setText(f"缓存文件夹：{self.workspace_root}")
+        self.cache_path_label.setText(f"缓存文件夹：{self.workspace_path}")
         self._set_progress_busy("正在提取哈希…")
         self._set_running(True)
         if suffix == ".7z":
@@ -294,74 +322,52 @@ class ArchiveCracker(QMainWindow):
         )
 
     def _prepare_workspace(self) -> None:
-        """Create an ASCII workspace and select an archive path legacy tools can read."""
+        """在用户指定缓存根目录创建任务目录，并准备旧工具可读取的路径。"""
         assert self.archive_path is not None
-        # Prefer an NTFS 8.3 path. It avoids copying potentially large archives,
-        # but is unavailable when 8.3 file names are disabled on the volume.
-        self.tool_archive_path = self._ascii_short_path(self.archive_path)
+        # 优先使用原始 ASCII 路径或 NTFS 8.3 短路径，避免复制大型压缩包。
+        self.tool_archive_path = (
+            self.archive_path
+            if str(self.archive_path).isascii()
+            else self._ascii_short_path(self.archive_path)
+        )
         staging_required = self.tool_archive_path is None
         required_space = 0
         if staging_required:
             archive_size = self.archive_path.stat().st_size
             required_space = archive_size + max(SPACE_RESERVE_BYTES, archive_size // 10)
 
-        candidates = self._fixed_drives_by_free_space()
-        eligible_drives = [drive for drive, free_space in candidates if free_space >= required_space]
-        if not eligible_drives:
+        workspace_root = self.cache_directory
+        try:
+            workspace_root.mkdir(parents=True, exist_ok=True)
+            free_space = shutil.disk_usage(workspace_root).free
+        except OSError as error:
+            raise OSError(f"无法访问缓存目录 {workspace_root}：{error}") from error
+        if staging_required and free_space < required_space:
             raise OSError(
-                "没有可用空间充足的本地固定磁盘。"
-                f" 需要至少 {self._format_bytes(required_space)}，"
-                "其中包含压缩包大小和安全余量。"
+                f"缓存目录可用空间不足：{workspace_root}\n"
+                f"需要至少 {self._format_bytes(required_space)}，当前可用 {self._format_bytes(free_space)}。"
             )
+        try:
+            self.workspace_path = Path(tempfile.mkdtemp(prefix="job-", dir=workspace_root))
+        except OSError as error:
+            raise OSError(f"无法在缓存目录 {workspace_root} 创建任务目录：{error}") from error
 
-        errors: list[str] = []
-        for drive in eligible_drives:
-            workspace_root = drive / "ArchiveCrackerTemp"
-            try:
-                workspace_root.mkdir(parents=True, exist_ok=True)
-                if staging_required and shutil.disk_usage(workspace_root).free < required_space:
-                    raise OSError("创建临时目录后可用空间不足")
-                self.workspace_path = Path(tempfile.mkdtemp(prefix="job-", dir=workspace_root))
-                self.workspace_root = workspace_root
-                break
-            except OSError as error:
-                errors.append(f"{drive}：{error}")
-                try:
-                    workspace_root.rmdir()
-                except OSError:
-                    pass
-        else:
-            raise OSError("无法在可用磁盘上创建临时工作目录。\n" + "\n".join(errors))
+        workspace_tool_path = self._ascii_short_path(self.workspace_path)
+        if workspace_tool_path is None:
+            if not str(self.workspace_path).isascii():
+                raise OSError(
+                    f"缓存路径包含非 ASCII 字符，且 Windows 未提供兼容短路径：{self.workspace_path}\n"
+                    "请选择仅包含英文和数字的缓存目录。"
+                )
+            workspace_tool_path = self.workspace_path
 
         if staging_required:
-            staged_archive = self.workspace_path / f"archive{self.archive_path.suffix.lower()}"
+            staged_archive = workspace_tool_path / f"archive{self.archive_path.suffix.lower()}"
             shutil.copy2(self.archive_path, staged_archive)
             self.tool_archive_path = staged_archive
 
-        self.hash_file = self.workspace_path / "archive.hash"
-        self.output_file = self.workspace_path / "recovered-password.txt"
-
-    @staticmethod
-    def _fixed_drives_by_free_space() -> list[tuple[Path, int]]:
-        """Return writable local fixed drives ordered by available space."""
-        buffer_size = ctypes.windll.kernel32.GetLogicalDriveStringsW(0, None)
-        if buffer_size == 0:
-            raise OSError("无法枚举本地磁盘。")
-        buffer = ctypes.create_unicode_buffer(buffer_size + 1)
-        result_size = ctypes.windll.kernel32.GetLogicalDriveStringsW(len(buffer), buffer)
-        if result_size == 0:
-            raise OSError("无法枚举本地磁盘。")
-
-        drives: list[tuple[Path, int]] = []
-        for drive_name in buffer[:result_size].split("\0"):
-            if not drive_name or ctypes.windll.kernel32.GetDriveTypeW(drive_name) != DRIVE_FIXED:
-                continue
-            drive = Path(drive_name)
-            try:
-                drives.append((drive, shutil.disk_usage(drive).free))
-            except OSError:
-                continue
-        return sorted(drives, key=lambda item: item[1], reverse=True)
+        self.hash_file = workspace_tool_path / "archive.hash"
+        self.output_file = workspace_tool_path / "recovered-password.txt"
 
     @staticmethod
     def _format_bytes(size: int) -> str:
@@ -521,7 +527,7 @@ class ArchiveCracker(QMainWindow):
             ["-m", str(mode), "-a", "3", "-1", charset, str(self.hash_file), mask,
              "--increment", "--increment-min", str(min_length), "--increment-max", str(max_length),
              "-o", str(self.output_file), "--outfile-format", "2", "--potfile-disable",
-             "--logfile-disable", "--restore-file-path", str(self.workspace_path / "hashcat.restore"),
+             "--logfile-disable", "--restore-file-path", str(self.hash_file.parent / "hashcat.restore"),
              "--status", "--status-json", "--status-timer", "1"],
             HASHCAT_DIR,
             self._on_cracking_finished,
@@ -607,11 +613,9 @@ class ArchiveCracker(QMainWindow):
         QMessageBox.critical(self, "操作失败", f"{message}\n\n{detail}".strip())
 
     def _cleanup_workspace(self) -> None:
-        """Remove this task's temporary files and the empty application root."""
+        """仅清理本次任务的临时子目录，保留用户选择的缓存根目录。"""
         workspace_path = self.workspace_path
-        workspace_root = self.workspace_root
         self.workspace_path = None
-        self.workspace_root = None
         self.tool_archive_path = None
         self.hash_file = None
         self.output_file = None
@@ -621,13 +625,11 @@ class ArchiveCracker(QMainWindow):
                 shutil.rmtree(workspace_path)
             except OSError:
                 pass
-        if workspace_root is not None:
-            try:
-                workspace_root.rmdir()
-            except OSError:
-                pass
         if workspace_path is not None:
-            self.cache_path_label.setText("缓存文件夹：已自动清理")
+            if not workspace_path.exists():
+                self.cache_path_label.setText("缓存文件夹：已自动清理")
+            else:
+                self.cache_path_label.setText(f"缓存文件夹：清理失败，仍保留在 {workspace_path}")
 
     def _set_progress_idle(self) -> None:
         self.progress_bar.setRange(0, 100)
@@ -650,6 +652,8 @@ class ArchiveCracker(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         self.select_button.setEnabled(not running)
+        self.cache_directory_button.setEnabled(not running)
+        self.cache_default_button.setEnabled(not running)
         self.start_button.setEnabled(not running and self.archive_path is not None)
         self.copy_button.setEnabled(not running and self._read_password() is not None)
 

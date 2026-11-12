@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from zip_hash import effective_hashcat_zip_mode, parse_zip_hash
+from archive_hash import parse_archive_hash
 
 
 # PyInstaller --onefile extracts bundled Python files to a temporary _MEI folder.
@@ -136,6 +137,7 @@ class ArchiveCracker(QMainWindow):
         self.zip_validation_required = False
         self.verifier: ZipCandidateVerifier | None = None
         self._stdout_buffer = bytearray()
+        self._extraction_output = bytearray()
         self._stderr_buffer = bytearray()
         self._process_output_truncated = False
         self._status_line_buffer = ""
@@ -471,6 +473,7 @@ class ArchiveCracker(QMainWindow):
     ) -> None:
         self.process = QProcess(self)
         self._stdout_buffer.clear()
+        self._extraction_output.clear()
         self._stderr_buffer.clear()
         self._process_output_truncated = False
         self._status_line_buffer = ""
@@ -491,7 +494,8 @@ class ArchiveCracker(QMainWindow):
         if self._status_updates_enabled:
             self._consume_status_output(output)
         else:
-            self._append_process_output(self._stdout_buffer, output)
+            # 提取器输出是待解析的哈希数据，不能套用诊断日志的大小上限。
+            self._extraction_output.extend(output)
 
     def _on_standard_error_ready(self) -> None:
         if self.process is not None:
@@ -529,7 +533,6 @@ class ArchiveCracker(QMainWindow):
         if len(self._status_line_buffer) > 64 * 1024:
             self._append_process_output(self._stdout_buffer, self._status_line_buffer.encode(errors="replace"))
             self._status_line_buffer = ""
-            self._process_output_truncated = True
         for line in lines:
             try:
                 status = json.loads(line)
@@ -603,7 +606,10 @@ class ArchiveCracker(QMainWindow):
     def _format_process_diagnostics(self, stdout: str, stderr: str) -> str:
         parts = []
         if stdout.strip():
-            parts.append(f"stdout:\n{stdout.strip()}")
+            shown = stdout.strip()
+            if len(shown) > 64 * 1024:
+                shown = shown[:64 * 1024] + "\n…诊断输出已省略；提取数据本身未截断。"
+            parts.append(f"stdout:\n{shown}")
         if stderr.strip():
             parts.append(f"stderr:\n{stderr.strip()}")
         if self._process_output_truncated:
@@ -613,7 +619,7 @@ class ArchiveCracker(QMainWindow):
     def _on_hash_extracted(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
         assert self.process is not None
         self._drain_process_output()
-        output = bytes(self._stdout_buffer).decode(errors="replace")
+        output = self._extraction_output.decode(errors="replace")
         error = bytes(self._stderr_buffer).decode(errors="replace")
         if exit_code != 0:
             self._fail("提取压缩包哈希失败。", self._format_process_diagnostics(output, error))
@@ -622,7 +628,7 @@ class ArchiveCracker(QMainWindow):
         try:
             self.extracted_hash, mode, self.zip_validation_required = self._parse_hash(output)
         except ValueError as parse_error:
-            self._fail("无法识别 ZIP 哈希结构。", f"{parse_error}\n\n{self._format_process_diagnostics(output, error)}")
+            self._fail("无法识别压缩包哈希结构。", f"{parse_error}\n\n{self._format_process_diagnostics(output, error)}")
             return
         if not self.extracted_hash or mode is None:
             self._fail("未能识别该压缩包的加密格式。", self._format_process_diagnostics(output, error))
@@ -661,19 +667,11 @@ class ArchiveCracker(QMainWindow):
 
     @staticmethod
     def _parse_hash(output: str) -> tuple[str | None, int | None, bool]:
-        rar_match = re.search(r"(\$rar3\$.*|\$rar5\$.*)", output, re.IGNORECASE)
-        if rar_match:
-            archive_hash = rar_match.group(1).strip()
-            return archive_hash, 12500 if archive_hash.lower().startswith("$rar3$") else 13000, False
-
         zip_hash, zip_mode, verify_zip_candidate = parse_zip_hash(output)
         if zip_hash:
             return zip_hash, zip_mode, verify_zip_candidate
-
-        seven_zip_match = re.search(r"(\$7z\$.*)", output)
-        if seven_zip_match:
-            return seven_zip_match.group(1).strip(), 11600, False
-        return None, None, False
+        archive_hash, archive_mode = parse_archive_hash(output)
+        return archive_hash, archive_mode, False
 
     def _selected_charset(self) -> str:
         charset_parts = []

@@ -7,9 +7,9 @@
 <img width="1144" height="857" alt="image" src="https://github.com/user-attachments/assets/2f49b57b-9e75-4970-8986-75c99d2c9448" />
 
 
-## 支持 RAR、ZIP、7Z
+## 支持格式
 
-可以近乎吃满显卡性能对加密 RAR、ZIP、7Z 文件快速恢复密码，实测4位密码加密在RTX3060 6G Loptop解密时长在50s左右。
+使用随附 hashcat 7.1.2 支持的 RAR3 类型 0、RAR3 类型 1（方法 30～35）、RAR5、ZIP 和 7z。7z 支持 Copy、LZMA、LZMA2、Deflate；PPMd、BZip2、截断数据及其他过滤器组合会在开始搜索前说明不受支持。
 
 It can nearly fully utilize the graphics card's performance for rapid password recovery from encrypted archives. In practical tests, a 4-digit password encrypted file took about 50 seconds to recover on an RTX 3060 6G Laptop.
 
@@ -55,9 +55,9 @@ Use the obtained hash value for the decryption core. The decryption speed depend
 
 ## 使用的 hashcat 模式
 
-- RAR3：`12500`；RAR5：`13000`
+- RAR3 类型 0：`12500`；RAR3 类型 1 方法 30：`23700`，方法 31～35：`23800`；RAR5：`13000`
 - ZIP：WinZip AES `13600`；单个 PKZIP Deflate / Store `17200` / `17210`；多文件全 Deflate `17220`；含 Store 的多文件 `17225`；校验和模式 `17230`
-- 7Z：`11600`
+- 7z Copy、LZMA、LZMA2、Deflate：`11600`
 
 随附 hashcat 7.1.2 的 `m17220_a3-pure.cl` 引用了缺失的 `inc_checksum_crc32.cl` 时，程序会将该任务改用兼容模式 `17225` 并在界面提示。校验和模式 `17230` 会在完整搜索后逐个验证候选密码；只有能完整读取原 ZIP 所有加密成员并通过 CRC 校验的候选才会显示为密码。
 

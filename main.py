@@ -12,30 +12,207 @@ import zipfile
 import zlib
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QThread, Qt, Signal
-from PySide6.QtGui import QCursor, QGuiApplication, QIcon
+from PySide6.QtCore import QProcess, QThread, Qt, QUrl, Signal
+from PySide6.QtGui import QCursor, QDesktopServices, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QFileDialog,
+    QCheckBox as QtCheckBox,
+    QComboBox,
+    QFileDialog as QtFileDialog,
     QLineEdit,
     QGridLayout,
-    QGroupBox,
+    QGroupBox as QtGroupBox,
     QHBoxLayout,
     QLayout,
-    QLabel,
+    QLabel as QtLabel,
     QMainWindow,
-    QMessageBox,
-    QProgressBar,
-    QPushButton,
+    QMessageBox as QtMessageBox,
+    QProgressBar as QtProgressBar,
+    QPushButton as QtPushButton,
     QSpinBox,
-    QToolTip,
+    QToolTip as QtToolTip,
     QVBoxLayout,
     QWidget,
 )
 
+
+# 以中文原文为翻译键，后续功能可在此集中扩充。
+TRANSLATIONS = {
+    "加密压缩包密码恢复工具": "Archive Password Recovery",
+    "文件名：未选择": "File: Not selected", "路径：未选择": "Path: Not selected", "：": ": ",
+    "选择 RAR / ZIP / 7Z 文件": "Select RAR / ZIP / 7Z file", "文件名：": "File: ", "路径：": "Path: ",
+    "未选择": "Not selected", "开始找回": "Start recovery", "暴力字符集：": "Character sets: ",
+    "数字 (0-9)": "Digits (0-9)", "小写字母 (a-z)": "Lowercase (a-z)", "大写字母 (A-Z)": "Uppercase (A-Z)", "特殊字符": "Special characters",
+    "密码长度：": "Password length: ", "最小": "Min", "最大": "Max", "密码：": "Password: ", "未开始": "Not started", "复制": "Copy",
+    "此缓存文件夹仅用于本次任务，并会在任务结束后自动删除。": "This job's cache folder is deleted when the job finishes.",
+    "每次任务会在此目录下创建独立子目录，任务结束后仅删除该子目录。": "Each job creates a separate subfolder here; only that subfolder is removed afterward.",
+    "缓存文件夹：": "Cache folder: ", "将在任务开始后创建": "Created when the job starts", "缓存位置：": "Cache location: ", "选择目录": "Choose folder", "恢复默认": "Reset default",
+    "等待任务开始": "Waiting to start", "版本号：": "Version: ", "工具存在检测": "Dependency check", "重新检测": "Check again",
+    "哈希提取器": "hash extractor", "✓ 已找到": "✓ Found", "✗ 未找到": "✗ Missing", "预期路径：": "Expected path: ",
+    "下载": "Download", "下载和安装说明": "Download and installation", "无法打开下载页面": "Could not open download page",
+    "请从官方页面下载 hashcat 7.1.2 二进制包，解压完整目录及其配套文件，使可执行文件位于：": "Download the hashcat 7.1.2 binaries from the official page and extract the complete directory with its supporting files so the executable is at:",
+    "请从官方页面下载 John the Ripper 1.9.0-jumbo-1 64 位 Windows 二进制包，解压完整目录及其配套文件，使可执行文件位于：": "Download the John the Ripper 1.9.0-jumbo-1 64-bit Windows binaries from the official page and extract the complete directory with its supporting files so the executable is at:",
+    "请从官方发布页面下载 7z2hashcat64-2.0.zip，解压其中的可执行文件至：": "Download 7z2hashcat64-2.0.zip from the official releases page and extract its executable to:",
+    "完成后点击“重新检测”。": "Select Check again when finished.",
+    "无法打开浏览器，请复制以下网址手动打开：": "Could not open the browser. Copy this address and open it manually:",
+    "官方页面：": "Official page: ",
+    "选择加密压缩包": "Select encrypted archive", "压缩包 (*.rar *.zip *.7z)": "Archives (*.rar *.zip *.7z)", "选择缓存目录": "Select cache folder",
+    "未选择文件": "No file selected", "请先选择一个 RAR、ZIP 或 7Z 文件。": "Select a RAR, ZIP or 7Z file first.", "不支持的格式": "Unsupported format", "目前仅支持 RAR、ZIP 和 7Z 文件。": "Only RAR, ZIP and 7Z files are supported.",
+    "缺少工具": "Missing tools", "找不到以下必需工具：": "Required tools not found:", "无法准备临时工作目录。": "Could not prepare the temporary workspace.",
+    "正在提取哈希…": "Extracting hash…", "正在找回…": "Recovering…", "正在验证候选密码…": "Verifying candidate passwords…",
+    "仅校验和模式，搜索完成后验证候选密码": "Checksum-only mode; candidates will be verified after the search",
+    "（hashcat 17220 上游文件缺失，使用兼容模式 17225）": " (hashcat 17220 files missing; using compatibility mode 17225)",
+    "计算中": "Calculating", "轮次 ": "Round ", "速度：": "Speed: ", "预计剩余：": "ETA: ", "天": "d ",
+    "任务完成": "Job complete", "任务失败": "Job failed", "操作失败": "Operation failed", "已自动清理": "Automatically removed", "清理失败，仍保留在 ": "Cleanup failed; retained at ",
+    "未找到有效密码": "No valid password found", "未找到（可尝试调整 hashcat 参数或掩码）": "Not found (try adjusting hashcat parameters or mask)",
+    "搜索完成，未找到通过 ZIP 完整校验的候选": "Search complete; no candidate passed ZIP verification",
+    "hashcat 执行失败。": "hashcat failed.", "无法验证 ZIP 候选密码。": "Could not verify ZIP candidates.", "无法启动外部工具。": "Could not start external tool.",
+    "提取压缩包哈希失败。": "Could not extract archive hash.", "无法识别压缩包哈希结构。": "Unrecognized archive hash structure.", "未能识别该压缩包的加密格式。": "Unrecognized archive encryption format.", "请至少选择一种暴力字符集。": "Select at least one character set.", "已复制密码": "Password copied",
+    "原 ZIP 中没有可验证的加密成员。": "The ZIP has no encrypted members to verify.", "候选验证已取消。": "Candidate verification cancelled.", "验证已取消。": "Verification cancelled.",
+    "检查了 ": "Checked ", " 个候选，没有候选能通过原 ZIP 完整校验。": " candidates; none passed ZIP verification.", " 最近一次校验错误：": " Last verification error: ", "读取原 ZIP 或候选结果时失败：": "Failed to read ZIP or candidates: ",
+    "无法访问缓存目录 ": "Cannot access cache folder ", "无法在缓存目录 ": "Cannot create a job folder in ", " 创建任务目录：": ": ", "缓存目录可用空间不足：": "Insufficient cache space: ", "需要至少 ": "At least ", "，当前可用 ": " required; available: ", "缓存路径包含非 ASCII 字符，且 Windows 未提供兼容短路径：": "Cache path contains non-ASCII characters and Windows provides no compatible short path: ", "请选择仅包含英文和数字的缓存目录。": "Choose a cache folder containing only English letters and digits.",
+    "…诊断输出已省略；提取数据本身未截断。": "…Diagnostic output omitted; extracted data was not truncated.", "外部工具输出超过 ": "External tool output exceeded ", " MiB，已截断后续内容。": " MiB; remaining output was truncated.",
+}
+_language = "zh"
+def translate(text: str) -> str:
+    if _language == "zh":
+        return text
+    if text in TRANSLATIONS:
+        return TRANSLATIONS[text]
+    # 文件名和路径属于用户数据，保留其原文。
+    for prefix in ("文件名：", "路径：", "预期路径：", "缓存文件夹：清理失败，仍保留在 "):
+        if text.startswith(prefix):
+            return TRANSLATIONS.get(prefix, "Cache folder: Cleanup failed; retained at ") + text[len(prefix):]
+    if text.startswith("缓存文件夹：") and text[len("缓存文件夹："):] not in ("将在任务开始后创建", "已自动清理"):
+        return TRANSLATIONS["缓存文件夹："] + text[len("缓存文件夹："):]
+    # 最长键优先，避免较短词条破坏完整句子。
+    pattern = re.compile("|".join(re.escape(k) for k in sorted(TRANSLATIONS, key=len, reverse=True)))
+    return pattern.sub(lambda match: TRANSLATIONS[match.group()], text)
+
+
+def _translate_verifier_detail(detail: str) -> str:
+    if _language == "zh":
+        return detail
+    for prefix in ("读取原 ZIP 或候选结果时失败：", " 最近一次校验错误："):
+        if prefix in detail:
+            before, raw = detail.split(prefix, 1)
+            return translate(before) + translate(prefix) + raw
+    return translate(detail)
+
+def _translate_workspace_error(detail: str) -> str:
+    if _language == "zh":
+        return detail
+    patterns = (
+        (r"^(无法访问缓存目录 )(.*?)(：)(.*)$", (1, 3)),
+        (r"^(无法在缓存目录 )(.*?)( 创建任务目录：)(.*)$", (1, 3)),
+        (r"^(缓存目录可用空间不足：)(.*?)(\n)(需要至少 )(.*?)(，当前可用 )(.*)$", (1, 4, 6)),
+        (r"^(缓存路径包含非 ASCII 字符，且 Windows 未提供兼容短路径：)(.*?)(\n)(请选择仅包含英文和数字的缓存目录。)$", (1, 4)),
+    )
+    for pattern, translated_groups in patterns:
+        match = re.match(pattern, detail, re.DOTALL)
+        if match:
+            return "".join(translate(value) if i in translated_groups else value
+                           for i, value in enumerate(match.groups(), 1))
+    return detail
+
+class _TranslatedWidget:
+    def setText(self, text):
+        self._source_text = text
+        self._text_data = None
+        self._detail = None
+        super().setText(translate(text))
+    def setTextWithData(self, prefix, data):
+        self._source_text = prefix
+        self._text_data = data
+        self._detail = None
+        super().setText(translate(prefix) + data)
+    def setTextWithDetail(self, prefix, detail):
+        self._source_text = prefix
+        self._text_data = None
+        self._detail = detail
+        super().setText(translate(prefix) + ("\n" + _translate_verifier_detail(detail) if detail else ""))
+    def setToolTip(self, text):
+        self._source_tooltip = text
+        self._tooltip_data = None
+        super().setToolTip(translate(text))
+    def setToolTipWithData(self, prefix, data):
+        self._source_tooltip = prefix
+        self._tooltip_data = data
+        super().setToolTip(translate(prefix) + data)
+    def retranslate(self):
+        if hasattr(self, "_source_text"):
+            detail = "\n" + _translate_verifier_detail(self._detail) if self._detail else ""
+            super().setText(translate(self._source_text) + (self._text_data or "") + detail)
+        if hasattr(self, "_source_tooltip"):
+            super().setToolTip(translate(self._source_tooltip) + (self._tooltip_data or ""))
+
+class QLabel(_TranslatedWidget, QtLabel):
+    def __init__(self, text="", *args):
+        super().__init__("", *args)
+        self.setText(text)
+class QPushButton(_TranslatedWidget, QtPushButton):
+    def __init__(self, text="", *args):
+        super().__init__("", *args)
+        self.setText(text)
+class QCheckBox(_TranslatedWidget, QtCheckBox):
+    def __init__(self, text="", *args):
+        super().__init__("", *args)
+        self.setText(text)
+class QGroupBox(QtGroupBox):
+    def __init__(self, title="", *args):
+        super().__init__(translate(title), *args)
+        self._source_title = title
+    def retranslate(self):
+        self.setTitle(translate(self._source_title))
+class QProgressBar(QtProgressBar):
+    def setFormat(self, text):
+        self._source_format = text
+        super().setFormat(translate(text))
+    def retranslate(self):
+        if hasattr(self, "_source_format"):
+            super().setFormat(translate(self._source_format))
+class QFileDialog:
+    @staticmethod
+    def getOpenFileName(parent, title, directory, filter):
+        return QtFileDialog.getOpenFileName(parent, translate(title), directory, translate(filter))
+    @staticmethod
+    def getExistingDirectory(parent, title, directory):
+        return QtFileDialog.getExistingDirectory(parent, translate(title), directory)
+class QMessageBox:
+    @staticmethod
+    def warning(parent, title, message):
+        return QtMessageBox.warning(parent, translate(title), translate(message))
+    @staticmethod
+    def critical(parent, title, message):
+        return QtMessageBox.critical(parent, translate(title), translate(message))
+
+class DownloadInfoDialog(QtMessageBox):
+    def __init__(self, parent, instruction: str, path: Path, url: str, opened: bool):
+        super().__init__(parent)
+        self.instruction, self.path, self.url, self.opened = instruction, path, url, opened
+        self.setModal(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.setStandardButtons(QtMessageBox.StandardButton.Ok)
+        self.retranslate()
+
+    def retranslate(self):
+        self.setWindowTitle(translate("下载和安装说明" if self.opened else "无法打开下载页面"))
+        failure = "" if self.opened else translate("无法打开浏览器，请复制以下网址手动打开：") + "\n"
+        self.setText(failure + translate("官方页面：") + self.url + "\n\n" +
+                     translate(self.instruction) + "\n" + str(self.path) + "\n\n" +
+                     translate("完成后点击“重新检测”。"))
+
+class QToolTip:
+    @staticmethod
+    def showText(pos, text, *args):
+        return QtToolTip.showText(pos, translate(text), *args)
+
+
 from zip_hash import effective_hashcat_zip_mode, parse_zip_hash
 from archive_hash import parse_archive_hash
+from parse_error_translation import translate_parse_error
 
 
 # PyInstaller --onefile extracts bundled Python files to a temporary _MEI folder.
@@ -149,6 +326,8 @@ class ArchiveCracker(QMainWindow):
             self.setWindowIcon(QIcon(str(icon_path)))
         self.setMinimumSize(680, 460)
         self.resize(760, 540)
+        global _language
+        _language = "zh"
         self._build_ui()
         self.setMinimumHeight(max(self.minimumHeight(), self.minimumSizeHint().height()))
 
@@ -158,6 +337,10 @@ class ArchiveCracker(QMainWindow):
         layout.setContentsMargins(28, 24, 28, 20)
         layout.setSpacing(12)
         layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+
+        self.language_combo = QComboBox()
+        self.language_combo.addItems(["中文", "English"])
+        self.language_combo.currentIndexChanged.connect(self._change_language)
 
         self.select_button = QPushButton("选择 RAR / ZIP / 7Z 文件")
         self.select_button.clicked.connect(self.select_file)
@@ -257,11 +440,25 @@ class ArchiveCracker(QMainWindow):
         self._build_tool_check_panel(layout)
 
         layout.addStretch()
-        version_label = QLabel("版本号：2.1.0")
+        footer_layout = QGridLayout()
+        footer_layout.setColumnStretch(0, 1)
+        footer_layout.setColumnStretch(2, 1)
+        footer_layout.addWidget(self.language_combo, 0, 0, alignment=Qt.AlignmentFlag.AlignLeft)
+        version_label = QLabel("版本号：2.1.1")
         version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(version_label)
+        footer_layout.addWidget(version_label, 0, 0, 1, 3, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addLayout(footer_layout)
 
         self.setCentralWidget(central_widget)
+
+    def _change_language(self, index: int) -> None:
+        global _language
+        _language = "en" if index else "zh"
+        self.setWindowTitle(translate("加密压缩包密码恢复工具"))
+        for widget in self.findChildren(QWidget):
+            if hasattr(widget, "retranslate"):
+                widget.retranslate()
+        self.cache_directory_input.setToolTip(translate("每次任务会在此目录下创建独立子目录，任务结束后仅删除该子目录。"))
 
     def _build_tool_check_panel(self, parent_layout: QVBoxLayout) -> None:
         """Add the bundled-tool availability panel below the progress bar."""
@@ -271,16 +468,21 @@ class ArchiveCracker(QMainWindow):
         tool_layout.setColumnStretch(1, 1)
 
         self.tool_status_labels: dict[str, QLabel] = {}
+        self.tool_download_buttons: dict[str, QPushButton] = {}
         for row, (key, name) in enumerate(self._tool_requirements().items()):
             tool_layout.addWidget(QLabel(name), row, 0)
             status_label = QLabel()
             status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             tool_layout.addWidget(status_label, row, 1)
             self.tool_status_labels[key] = status_label
+            download_button = QPushButton("下载")
+            download_button.clicked.connect(lambda checked=False, tool_key=key: self._open_tool_download(tool_key))
+            tool_layout.addWidget(download_button, row, 2)
+            self.tool_download_buttons[key] = download_button
 
         refresh_button = QPushButton("重新检测")
         refresh_button.clicked.connect(self._refresh_tool_status)
-        tool_layout.addWidget(refresh_button, len(self.tool_status_labels), 1, alignment=Qt.AlignmentFlag.AlignRight)
+        tool_layout.addWidget(refresh_button, len(self.tool_status_labels), 2, alignment=Qt.AlignmentFlag.AlignRight)
         parent_layout.addWidget(tool_group)
         self._refresh_tool_status()
 
@@ -307,15 +509,31 @@ class ArchiveCracker(QMainWindow):
         availability = {key: path.is_file() for key, path in self._tool_paths().items()}
         for key, is_available in availability.items():
             label = self.tool_status_labels[key]
+            self.tool_download_buttons[key].setVisible(not is_available)
             if is_available:
                 label.setText("✓ 已找到")
                 label.setStyleSheet("color: #188038;")
-                label.setToolTip(str(self._tool_paths()[key]))
+                label.setToolTipWithData("", str(self._tool_paths()[key]))
             else:
                 label.setText("✗ 未找到")
                 label.setStyleSheet("color: #c5221f;")
                 label.setToolTip(f"预期路径：{self._tool_paths()[key]}")
         return availability
+
+    def _open_tool_download(self, key: str) -> None:
+        sources = {
+            "hashcat": ("https://hashcat.net/hashcat/", "请从官方页面下载 hashcat 7.1.2 二进制包，解压完整目录及其配套文件，使可执行文件位于："),
+            "rar2john": ("https://www.openwall.com/john/", "请从官方页面下载 John the Ripper 1.9.0-jumbo-1 64 位 Windows 二进制包，解压完整目录及其配套文件，使可执行文件位于："),
+            "zip2john": ("https://www.openwall.com/john/", "请从官方页面下载 John the Ripper 1.9.0-jumbo-1 64 位 Windows 二进制包，解压完整目录及其配套文件，使可执行文件位于："),
+            "7z2hashcat": ("https://github.com/philsmd/7z2hashcat/releases/tag/2.0", "请从官方发布页面下载 7z2hashcat64-2.0.zip，解压其中的可执行文件至："),
+        }
+        url, instruction = sources[key]
+        try:
+            opened = QDesktopServices.openUrl(QUrl(url))
+        except Exception:
+            opened = False
+        dialog = DownloadInfoDialog(self, instruction, self._tool_paths()[key], url, opened)
+        dialog.show()
 
     def select_file(self) -> None:
         file_name, _ = QFileDialog.getOpenFileName(
@@ -328,9 +546,10 @@ class ArchiveCracker(QMainWindow):
             return
 
         self.archive_path = Path(file_name)
+        self.recovered_password = None
         self.zip_validation_required = False
-        self.filename_label.setText(f"文件名：{self.archive_path.name}")
-        self.filepath_label.setText(f"路径：{self.archive_path}")
+        self.filename_label.setTextWithData("文件名：", self.archive_path.name)
+        self.filepath_label.setTextWithData("路径：", str(self.archive_path))
         self.password_label.setText("密码：未开始")
         self.cache_path_label.setText("缓存文件夹：将在任务开始后创建")
         self._set_progress_idle()
@@ -372,7 +591,7 @@ class ArchiveCracker(QMainWindow):
             self._prepare_workspace()
         except OSError as error:
             self._cleanup_workspace()
-            self._fail("无法准备临时工作目录。", str(error))
+            self._fail("无法准备临时工作目录。", _translate_workspace_error(str(error)))
             return
 
         self.extracted_hash = None
@@ -608,12 +827,12 @@ class ArchiveCracker(QMainWindow):
         if stdout.strip():
             shown = stdout.strip()
             if len(shown) > 64 * 1024:
-                shown = shown[:64 * 1024] + "\n…诊断输出已省略；提取数据本身未截断。"
+                shown = shown[:64 * 1024] + "\n" + translate("…诊断输出已省略；提取数据本身未截断。")
             parts.append(f"stdout:\n{shown}")
         if stderr.strip():
             parts.append(f"stderr:\n{stderr.strip()}")
         if self._process_output_truncated:
-            parts.append(f"外部工具输出超过 {MAX_PROCESS_OUTPUT_BYTES // (1024 * 1024)} MiB，已截断后续内容。")
+            parts.append(translate(f"外部工具输出超过 {MAX_PROCESS_OUTPUT_BYTES // (1024 * 1024)} MiB，已截断后续内容。"))
         return "\n\n".join(parts)
 
     def _on_hash_extracted(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
@@ -628,7 +847,7 @@ class ArchiveCracker(QMainWindow):
         try:
             self.extracted_hash, mode, self.zip_validation_required = self._parse_hash(output)
         except ValueError as parse_error:
-            self._fail("无法识别压缩包哈希结构。", f"{parse_error}\n\n{self._format_process_diagnostics(output, error)}")
+            self._fail("无法识别压缩包哈希结构。", f"{translate_parse_error(str(parse_error), _language)}\n\n{self._format_process_diagnostics(output, error)}")
             return
         if not self.extracted_hash or mode is None:
             self._fail("未能识别该压缩包的加密格式。", self._format_process_diagnostics(output, error))
@@ -718,7 +937,7 @@ class ArchiveCracker(QMainWindow):
         password = self._read_password()
         if password is not None:
             self.recovered_password = password
-            self.password_label.setText(f"密码：{password}")
+            self.password_label.setTextWithData("密码：", password)
             self.copy_button.setEnabled(True)
         elif exit_code in (0, 1):
             self.password_label.setText("密码：未找到（可尝试调整 hashcat 参数或掩码）")
@@ -735,13 +954,13 @@ class ArchiveCracker(QMainWindow):
         self.verifier = None
         if isinstance(candidate, bytes):
             self.recovered_password = candidate.decode("utf-8", errors="replace")
-            self.password_label.setText(f"密码：{self.recovered_password}")
+            self.password_label.setTextWithData("密码：", self.recovered_password)
             self.copy_button.setEnabled(True)
         elif detail.startswith("读取原 ZIP 或候选结果时失败"):
-            self._fail("无法验证 ZIP 候选密码。", detail)
+            self._fail("无法验证 ZIP 候选密码。", _translate_verifier_detail(detail))
             return
         else:
-            self.password_label.setText("密码：未找到有效密码" + (f"\n{detail}" if detail else ""))
+            self.password_label.setTextWithDetail("密码：未找到有效密码", detail)
             self.progress_bar.setFormat("搜索完成，未找到通过 ZIP 完整校验的候选")
         self._cleanup_workspace()
         self._set_progress_complete()
@@ -768,7 +987,7 @@ class ArchiveCracker(QMainWindow):
         self._cleanup_workspace()
         self._set_progress_failed()
         self._set_running(False)
-        QMessageBox.critical(self, "操作失败", f"{message}\n\n{detail}".strip())
+        QtMessageBox.critical(self, translate("操作失败"), (translate(message) + ("\n\n" + detail if detail else "")))
 
     def closeEvent(self, event) -> None:
         if self.verifier is not None:

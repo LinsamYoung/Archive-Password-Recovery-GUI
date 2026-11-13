@@ -1,4 +1,4 @@
-# 加密压缩包密码恢复工具 v2.1.0
+# 加密压缩包密码恢复工具 v2.1.1
 *图形用户界面化操作 hashcat 对加密 RAR、ZIP、7Z 文件进行密码恢复。*
 
 *A GUI for operating hashcat to recover passwords from encrypted RAR, ZIP, and 7Z archives.*
